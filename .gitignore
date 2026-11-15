@@ -1,0 +1,9 @@
+/server
+/bin/
+*.exe
+*.test
+*.out
+*.aof
+.idea/
+.vscode/
+.DS_Store
