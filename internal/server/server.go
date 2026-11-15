@@ -1,15 +1,13 @@
 package server
 
 import (
-	"bufio"
 	"errors"
 	"io"
 	"log"
 	"net"
-	"strings"
-)
 
-const pongReply = "+PONG\r\n"
+	"github.com/LewzzJrs/redis-from-scratch/internal/resp"
+)
 
 type Server struct {
 	listener net.Listener
@@ -39,25 +37,44 @@ func (s *Server) Close() error {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	reader := bufio.NewReader(conn)
+	reader := resp.NewReader(conn)
+	writer := resp.NewWriter(conn)
+
 	for {
-		line, err := reader.ReadString('\n')
+		args, err := reader.ReadCommand()
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Printf("read from %s failed: %v", conn.RemoteAddr(), err)
-			}
+			s.handleReadError(conn, writer, err)
+			return
+		}
+		if len(args) == 0 {
+			continue
+		}
+
+		if err := writer.Write(executeCommand(args)); err != nil {
+			log.Printf("write to %s failed: %v", conn.RemoteAddr(), err)
 			return
 		}
 
-		if isPingCommand(line) {
-			if _, err := io.WriteString(conn, pongReply); err != nil {
-				log.Printf("write to %s failed: %v", conn.RemoteAddr(), err)
+		if reader.Buffered() == 0 {
+			if err := writer.Flush(); err != nil {
+				log.Printf("flush to %s failed: %v", conn.RemoteAddr(), err)
 				return
 			}
 		}
 	}
 }
 
-func isPingCommand(line string) bool {
-	return strings.EqualFold(strings.TrimSpace(line), "PING")
+func (s *Server) handleReadError(conn net.Conn, writer *resp.Writer, err error) {
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return
+	}
+
+	var protocolError *resp.ProtocolError
+	if errors.As(err, &protocolError) {
+		writer.Write(resp.NewError("ERR Protocol error: " + protocolError.Reason))
+		writer.Flush()
+		return
+	}
+
+	log.Printf("read from %s failed: %v", conn.RemoteAddr(), err)
 }

@@ -1,12 +1,21 @@
 package server
 
 import (
-	"bufio"
+	"errors"
 	"io"
 	"net"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/LewzzJrs/redis-from-scratch/internal/resp"
 )
+
+type testClient struct {
+	t      *testing.T
+	conn   net.Conn
+	reader *resp.Reader
+}
 
 func startTestServer(t *testing.T) string {
 	t.Helper()
@@ -23,10 +32,10 @@ func startTestServer(t *testing.T) string {
 	return listener.Addr().String()
 }
 
-func dialTestServer(t *testing.T, address string) (net.Conn, *bufio.Reader) {
+func connectTestClient(t *testing.T) *testClient {
 	t.Helper()
 
-	conn, err := net.Dial("tcp", address)
+	conn, err := net.Dial("tcp", startTestServer(t))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -35,7 +44,25 @@ func dialTestServer(t *testing.T, address string) (net.Conn, *bufio.Reader) {
 	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("set deadline: %v", err)
 	}
-	return conn, bufio.NewReader(conn)
+	return &testClient{t: t, conn: conn, reader: resp.NewReader(conn)}
+}
+
+func (c *testClient) send(rawRequest string) {
+	c.t.Helper()
+	if _, err := io.WriteString(c.conn, rawRequest); err != nil {
+		c.t.Fatalf("write: %v", err)
+	}
+}
+
+func (c *testClient) expectReply(expected resp.Value) {
+	c.t.Helper()
+	reply, err := c.reader.ReadValue()
+	if err != nil {
+		c.t.Fatalf("read reply: %v", err)
+	}
+	if !reflect.DeepEqual(reply, expected) {
+		c.t.Fatalf("got %#v, want %#v", reply, expected)
+	}
 }
 
 func TestPingRespondsWithPong(t *testing.T) {
@@ -47,40 +74,52 @@ func TestPingRespondsWithPong(t *testing.T) {
 
 	for name, request := range requests {
 		t.Run(name, func(t *testing.T) {
-			address := startTestServer(t)
-			conn, reader := dialTestServer(t, address)
-
-			if _, err := io.WriteString(conn, request); err != nil {
-				t.Fatalf("write: %v", err)
-			}
-
-			reply, err := reader.ReadString('\n')
-			if err != nil {
-				t.Fatalf("read: %v", err)
-			}
-			if reply != pongReply {
-				t.Fatalf("got %q, want %q", reply, pongReply)
-			}
+			client := connectTestClient(t)
+			client.send(request)
+			client.expectReply(resp.NewSimpleString("PONG"))
 		})
 	}
 }
 
-func TestPipelinedPingsGetOneReplyEach(t *testing.T) {
-	address := startTestServer(t)
-	conn, reader := dialTestServer(t, address)
+func TestPingWithMessageEchoesMessage(t *testing.T) {
+	client := connectTestClient(t)
+	client.send("*2\r\n$4\r\nPING\r\n$11\r\nhello world\r\n")
+	client.expectReply(resp.NewBulkString("hello world"))
+}
 
-	pipelinedPings := "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n"
-	if _, err := io.WriteString(conn, pipelinedPings); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+func TestPingWithTooManyArgumentsReturnsError(t *testing.T) {
+	client := connectTestClient(t)
+	client.send("PING a b\r\n")
+	client.expectReply(resp.NewError("ERR wrong number of arguments for 'ping' command"))
+}
 
-	for replyIndex := range 3 {
-		reply, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("read reply %d: %v", replyIndex, err)
-		}
-		if reply != pongReply {
-			t.Fatalf("reply %d: got %q, want %q", replyIndex, reply, pongReply)
-		}
+func TestPipelinedCommandsGetOneReplyEach(t *testing.T) {
+	client := connectTestClient(t)
+	client.send("*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nPING\r\n$2\r\nhi\r\n")
+
+	client.expectReply(resp.NewSimpleString("PONG"))
+	client.expectReply(resp.NewSimpleString("PONG"))
+	client.expectReply(resp.NewBulkString("hi"))
+}
+
+func TestEmptyLinesAreIgnored(t *testing.T) {
+	client := connectTestClient(t)
+	client.send("\r\n\r\nPING\r\n")
+	client.expectReply(resp.NewSimpleString("PONG"))
+}
+
+func TestUnknownCommandReturnsError(t *testing.T) {
+	client := connectTestClient(t)
+	client.send("*3\r\n$5\r\nHELLO\r\n$1\r\na\r\n$1\r\nb\r\n")
+	client.expectReply(resp.NewError("ERR unknown command 'HELLO', with args beginning with: 'a' 'b' "))
+}
+
+func TestProtocolErrorRepliesAndClosesConnection(t *testing.T) {
+	client := connectTestClient(t)
+	client.send("*1\r\n$abc\r\n")
+	client.expectReply(resp.NewError(`ERR Protocol error: invalid bulk length "abc"`))
+
+	if _, err := client.reader.ReadValue(); !errors.Is(err, io.EOF) {
+		t.Fatalf("got %v, want connection closed (io.EOF)", err)
 	}
 }
