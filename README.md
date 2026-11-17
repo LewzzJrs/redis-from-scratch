@@ -224,3 +224,13 @@ CI runs on every push: formatting, `go vet`, tests with `-race` on Linux, tests 
 
 ## What I learned
 
+- **A protocol is mostly edge cases.** Parsing a well-formed `SET` is the easy part. Most of the parser deals with partial reads, pipelined commands, and binary values, and with telling a truncated message apart from a malformed one. Fuzzing found a bug I would never have thought to test: an 18-byte header could make the server allocate 512 MB.
+- **Concurrent code needs evidence, not confidence.** Releasing a read lock and taking a write lock looks harmless until another client writes in between. Running the race detector on every change, and writing tests such as "50 goroutines increment a counter, the result must be exactly 5000", is what made me trust the locking.
+- **Durability is a contract, not a file write.** Appending commands to a file is easy. Making a replay after a crash rebuild exactly the same state is not: relative TTLs have to become absolute timestamps, `INCR` has to be logged as its result, a cut-off last command has to be distinguished from corruption, and a client must not see `OK` before its write is durable.
+- **Measure before claiming.** Comparing against real Redis showed that my first AOF reached only 4% of its speed with `appendfsync always`. Understanding why led me to group commit, which made it 22× faster. Running the benchmark more than once also taught me that numbers from a laptop vary, and that only results from the same run should be compared.
+- **The Go standard library goes a long way.** TCP, buffered I/O, locks, fuzzing, benchmarks, and the race detector all come with Go. The whole server has no dependencies, and its Docker image is under 10 MB.
+
+## License
+
+[MIT](LICENSE)
+
