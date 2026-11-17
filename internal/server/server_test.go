@@ -2,9 +2,11 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,7 +19,7 @@ type testClient struct {
 	reader *resp.Reader
 }
 
-func startTestServer(t *testing.T) string {
+func startTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -29,13 +31,19 @@ func startTestServer(t *testing.T) string {
 	go testServer.Serve()
 	t.Cleanup(func() { testServer.Close() })
 
-	return listener.Addr().String()
+	return testServer, listener.Addr().String()
 }
 
 func connectTestClient(t *testing.T) *testClient {
 	t.Helper()
+	_, address := startTestServer(t)
+	return dialTestClient(t, address)
+}
 
-	conn, err := net.Dial("tcp", startTestServer(t))
+func dialTestClient(t *testing.T, address string) *testClient {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -121,5 +129,113 @@ func TestProtocolErrorRepliesAndClosesConnection(t *testing.T) {
 
 	if _, err := client.reader.ReadValue(); !errors.Is(err, io.EOF) {
 		t.Fatalf("got %v, want connection closed (io.EOF)", err)
+	}
+}
+
+func TestIdleClientDoesNotBlockOtherClients(t *testing.T) {
+	_, address := startTestServer(t)
+
+	idleClient := dialTestClient(t, address)
+	idleClient.send("PING\r\n")
+	idleClient.expectReply(resp.NewSimpleString("PONG"))
+
+	activeClient := dialTestClient(t, address)
+	activeClient.send("PING\r\n")
+	activeClient.expectReply(resp.NewSimpleString("PONG"))
+}
+
+func TestManyClientsAreServedConcurrently(t *testing.T) {
+	_, address := startTestServer(t)
+
+	const clientCount = 50
+	const pingsPerClient = 20
+
+	var clients sync.WaitGroup
+	failures := make(chan error, clientCount)
+	for clientIndex := range clientCount {
+		clients.Go(func() {
+			if err := pingRepeatedly(address, clientIndex, pingsPerClient); err != nil {
+				failures <- err
+			}
+		})
+	}
+	clients.Wait()
+	close(failures)
+
+	for err := range failures {
+		t.Error(err)
+	}
+}
+
+func pingRepeatedly(address string, clientIndex int, pingCount int) error {
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("client %d dial: %w", clientIndex, err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("client %d set deadline: %w", clientIndex, err)
+	}
+
+	reader := resp.NewReader(conn)
+	writer := resp.NewWriter(conn)
+	for pingIndex := range pingCount {
+		message := fmt.Sprintf("client-%d-ping-%d", clientIndex, pingIndex)
+
+		writer.Write(resp.NewCommand("PING", message))
+		if err := writer.Flush(); err != nil {
+			return fmt.Errorf("client %d send: %w", clientIndex, err)
+		}
+
+		reply, err := reader.ReadValue()
+		if err != nil {
+			return fmt.Errorf("client %d read: %w", clientIndex, err)
+		}
+		if reply.Type != resp.BulkString || reply.Text != message {
+			return fmt.Errorf("client %d got %#v, want bulk string %q", clientIndex, reply, message)
+		}
+	}
+	return nil
+}
+
+func TestCloseDisconnectsClientsAndStopsServe(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	testServer := New(listener)
+
+	serveResult := make(chan error, 1)
+	go func() {
+		serveResult <- testServer.Serve()
+	}()
+
+	client := dialTestClient(t, listener.Addr().String())
+	client.send("PING\r\n")
+	client.expectReply(resp.NewSimpleString("PONG"))
+
+	if connected := testServer.ConnectedClients(); connected != 1 {
+		t.Fatalf("got %d connected clients before close, want 1", connected)
+	}
+
+	if err := testServer.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	select {
+	case err := <-serveResult:
+		if err != nil {
+			t.Fatalf("Serve returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after Close")
+	}
+
+	if _, err := client.reader.ReadValue(); err == nil {
+		t.Fatal("expected client connection to be closed by server")
+	}
+	if connected := testServer.ConnectedClients(); connected != 0 {
+		t.Fatalf("got %d connected clients after close, want 0", connected)
 	}
 }
