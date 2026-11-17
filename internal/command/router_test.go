@@ -12,7 +12,7 @@ import (
 )
 
 func newTestRouter() *Router {
-	return NewRouter(store.New())
+	return NewRouter(store.New(), nil)
 }
 
 func expectReply(t *testing.T, router *Router, args []string, expected resp.Value) {
@@ -104,7 +104,7 @@ func (c *fakeClock) Advance(duration time.Duration) {
 
 func newRouterWithFakeClock() (*Router, *fakeClock) {
 	clock := &fakeClock{current: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
-	return NewRouter(store.NewWithClock(clock.Now)), clock
+	return NewRouter(store.NewWithClock(clock.Now), nil), clock
 }
 
 func TestSetWithExExpiresAfterSeconds(t *testing.T) {

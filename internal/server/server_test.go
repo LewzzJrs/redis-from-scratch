@@ -22,7 +22,7 @@ type testClient struct {
 }
 
 func newTestRouter() *command.Router {
-	return command.NewRouter(store.New())
+	return command.NewRouter(store.New(), nil)
 }
 
 func startTestServer(t *testing.T) (*Server, string) {

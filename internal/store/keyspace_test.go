@@ -80,7 +80,7 @@ func TestIncrementMissingKeyStartsFromZero(t *testing.T) {
 	dataStore := New()
 
 	for expected := int64(1); expected <= 3; expected++ {
-		got, err := dataStore.Increment("counter", 1)
+		got, _, err := dataStore.Increment("counter", 1)
 		if err != nil || got != expected {
 			t.Fatalf("got (%d, %v), want (%d, nil)", got, err, expected)
 		}
@@ -106,7 +106,7 @@ func TestIncrementExistingNumbers(t *testing.T) {
 		dataStore := New()
 		dataStore.Set("n", testCase.initial)
 
-		got, err := dataStore.Increment("n", testCase.delta)
+		got, _, err := dataStore.Increment("n", testCase.delta)
 		if err != nil || got != testCase.expected {
 			t.Errorf("%s %+d: got (%d, %v), want (%d, nil)", testCase.initial, testCase.delta, got, err, testCase.expected)
 		}
@@ -118,7 +118,7 @@ func TestIncrementRejectsNonCanonicalIntegers(t *testing.T) {
 		dataStore := New()
 		dataStore.Set("n", value)
 
-		if _, err := dataStore.Increment("n", 1); !errors.Is(err, ErrNotInteger) {
+		if _, _, err := dataStore.Increment("n", 1); !errors.Is(err, ErrNotInteger) {
 			t.Errorf("value %q: got %v, want ErrNotInteger", value, err)
 		}
 		if stored, _ := dataStore.Get("n"); stored != value {
@@ -132,10 +132,10 @@ func TestIncrementDetectsOverflow(t *testing.T) {
 	dataStore.Set("max", strconv.FormatInt(math.MaxInt64, 10))
 	dataStore.Set("min", strconv.FormatInt(math.MinInt64, 10))
 
-	if _, err := dataStore.Increment("max", 1); !errors.Is(err, ErrIncrementOverflow) {
+	if _, _, err := dataStore.Increment("max", 1); !errors.Is(err, ErrIncrementOverflow) {
 		t.Errorf("max + 1: got %v, want ErrIncrementOverflow", err)
 	}
-	if _, err := dataStore.Increment("min", -1); !errors.Is(err, ErrIncrementOverflow) {
+	if _, _, err := dataStore.Increment("min", -1); !errors.Is(err, ErrIncrementOverflow) {
 		t.Errorf("min - 1: got %v, want ErrIncrementOverflow", err)
 	}
 }
@@ -146,8 +146,12 @@ func TestIncrementKeepsExistingExpiry(t *testing.T) {
 	dataStore.SetWithExpiry("rate:limit", "5", 10*time.Second)
 
 	clock.Advance(5 * time.Second)
-	if got, _ := dataStore.Increment("rate:limit", 1); got != 6 {
+	got, expiresAt, _ := dataStore.Increment("rate:limit", 1)
+	if got != 6 {
 		t.Fatalf("got %d, want 6", got)
+	}
+	if want := clock.Now().Add(5 * time.Second); !expiresAt.Equal(want) {
+		t.Fatalf("increment reported expiry %v, want %v", expiresAt, want)
 	}
 
 	clock.Advance(6 * time.Second)
@@ -162,8 +166,9 @@ func TestIncrementExpiredKeyStartsOverWithoutExpiry(t *testing.T) {
 	dataStore.SetWithExpiry("visits", "41", time.Second)
 	clock.Advance(2 * time.Second)
 
-	if got, _ := dataStore.Increment("visits", 1); got != 1 {
-		t.Fatalf("got %d, want 1", got)
+	got, expiresAt, _ := dataStore.Increment("visits", 1)
+	if got != 1 || !expiresAt.IsZero() {
+		t.Fatalf("got (%d, %v), want (1, no expiry)", got, expiresAt)
 	}
 	clock.Advance(time.Hour)
 	if !dataStore.Exists("visits") {

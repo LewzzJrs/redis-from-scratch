@@ -7,6 +7,9 @@ import (
 
 func (r *Router) del(args []string) resp.Value {
 	deletedCount := r.store.Delete(args[1:]...)
+	if deletedCount > 0 {
+		r.persist(args...)
+	}
 	return resp.NewInteger(int64(deletedCount))
 }
 

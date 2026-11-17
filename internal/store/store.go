@@ -69,11 +69,23 @@ func (s *Store) Set(key string, value string) {
 }
 
 func (s *Store) SetWithExpiry(key string, value string, timeToLive time.Duration) {
+	s.SetWithDeadline(key, value, s.now().Add(timeToLive))
+}
+
+func (s *Store) SetWithDeadline(key string, value string, deadline time.Time) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	s.data[key] = entry{value: value, expiresAt: s.now().Add(timeToLive)}
+	if s.now().After(deadline) {
+		s.deleteKey(key)
+		return
+	}
+	s.data[key] = entry{value: value, expiresAt: deadline}
 	s.keysWithExpiry[key] = struct{}{}
+}
+
+func (s *Store) Now() time.Time {
+	return s.now()
 }
 
 func (s *Store) Delete(keys ...string) int {
@@ -117,7 +129,7 @@ func (s *Store) Keys(matches func(key string) bool) []string {
 	return matchingKeys
 }
 
-func (s *Store) Increment(key string, delta int64) (int64, error) {
+func (s *Store) Increment(key string, delta int64) (newNumber int64, expiresAt time.Time, err error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
@@ -131,19 +143,19 @@ func (s *Store) Increment(key string, delta int64) (int64, error) {
 	if found {
 		parsedNumber, isInteger := parseStrictInteger(storedEntry.value)
 		if !isInteger {
-			return 0, ErrNotInteger
+			return 0, time.Time{}, ErrNotInteger
 		}
 		currentNumber = parsedNumber
 	}
 
 	if wouldOverflow(currentNumber, delta) {
-		return 0, ErrIncrementOverflow
+		return 0, time.Time{}, ErrIncrementOverflow
 	}
 
-	nextNumber := currentNumber + delta
-	storedEntry.value = strconv.FormatInt(nextNumber, 10)
+	newNumber = currentNumber + delta
+	storedEntry.value = strconv.FormatInt(newNumber, 10)
 	s.data[key] = storedEntry
-	return nextNumber, nil
+	return newNumber, storedEntry.expiresAt, nil
 }
 
 func parseStrictInteger(text string) (int64, bool) {
