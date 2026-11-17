@@ -14,15 +14,28 @@ import (
 )
 
 type recordingLog struct {
-	mutex   sync.Mutex
-	entries [][]string
+	mutex          sync.Mutex
+	entries        [][]string
+	waitedSequence []uint64
 }
 
-func (l *recordingLog) Append(args ...string) error {
+func (l *recordingLog) Append(args ...string) (uint64, error) {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 	l.entries = append(l.entries, slices.Clone(args))
-	return nil
+	return uint64(len(l.entries)), nil
+}
+
+func (l *recordingLog) WaitUntilDurable(sequence uint64) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	l.waitedSequence = append(l.waitedSequence, sequence)
+}
+
+func (l *recordingLog) waits() []uint64 {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	return slices.Clone(l.waitedSequence)
 }
 
 func (l *recordingLog) recorded() [][]string {
@@ -174,13 +187,54 @@ func TestRecordedOrderMatchesStoreOrderUnderConcurrency(t *testing.T) {
 
 type failingLog struct{}
 
-func (failingLog) Append(args ...string) error {
-	return errors.New("disk full")
+func (failingLog) Append(args ...string) (uint64, error) {
+	return 0, errors.New("disk full")
 }
+
+func (failingLog) WaitUntilDurable(sequence uint64) {}
 
 func TestWriteStillAppliesWhenLogFails(t *testing.T) {
 	router := NewRouter(store.New(), failingLog{})
 
 	expectReply(t, router, []string{"SET", "k", "v"}, resp.NewSimpleString("OK"))
 	expectReply(t, router, []string{"GET", "k"}, resp.NewBulkString("v"))
+}
+
+func TestSessionWaitsForItsLatestWriteOnly(t *testing.T) {
+	commandLog := &recordingLog{}
+	router := NewRouter(store.New(), commandLog)
+	session := router.NewSession()
+
+	session.WaitUntilDurable()
+	session.Execute([]string{"GET", "k"})
+	session.WaitUntilDurable()
+	if waits := commandLog.waits(); len(waits) != 0 {
+		t.Fatalf("a session without writes waited for %v", waits)
+	}
+
+	session.Execute([]string{"SET", "a", "1"})
+	session.Execute([]string{"SET", "b", "2"})
+	session.Execute([]string{"GET", "a"})
+	session.Execute([]string{"INCR", "a"})
+	session.Execute([]string{"DEL", "missing"})
+	session.WaitUntilDurable()
+	session.WaitUntilDurable()
+
+	if waits := commandLog.waits(); !slices.Equal(waits, []uint64{3}) {
+		t.Fatalf("got waits %v, want a single wait for sequence 3", waits)
+	}
+}
+
+func TestSessionsTrackTheirOwnWrites(t *testing.T) {
+	commandLog := &recordingLog{}
+	router := NewRouter(store.New(), commandLog)
+	firstSession, secondSession := router.NewSession(), router.NewSession()
+
+	firstSession.Execute([]string{"SET", "a", "1"})
+	secondSession.Execute([]string{"SET", "b", "2"})
+	firstSession.WaitUntilDurable()
+
+	if waits := commandLog.waits(); !slices.Equal(waits, []uint64{1}) {
+		t.Fatalf("got waits %v, want the first session to wait only for its own write", waits)
+	}
 }

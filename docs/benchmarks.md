@@ -4,10 +4,9 @@ redis-from-scratch measured against Redis 7.4 with the official `redis-benchmark
 
 ## Summary
 
-- Without pipelining, redis-from-scratch reaches **63–70% of Redis 7** throughput for SET and GET.
-- With 16-command pipelining, **GET is on par with Redis 7** (573k vs 546k requests/sec), because reads run in parallel under a read lock across all cores.
-- With 16-command pipelining, **SET reaches 46% of Redis 7**, because every write takes a global lock and makes its own `write()` call to the append-only file.
-- With `appendfsync always`, redis-from-scratch is **23× slower** than Redis 7. It calls `fsync` once per command, while Redis groups the writes of many clients into a single `fsync`.
+- With 16-command pipelining, redis-from-scratch reaches **89% of Redis 7 for SET** and **92% for GET**.
+- With `appendfsync always`, which acknowledges a write only after it is on disk, it reaches **91% of Redis 7**. Group commit made this **22× faster** than the first version, which called `fsync` once per command.
+- Without pipelining, it reaches **65–67% of Redis 7**. Here every request pays a full network round trip plus per-request overhead in the server.
 
 ## Environment
 
@@ -34,38 +33,57 @@ Both servers and the benchmark client ran as containers on the same Docker netwo
 
 | Server | Command | Pipeline | Requests/sec | vs Redis 7 |
 |---|---|---:|---:|---:|
-| redis-from-scratch | SET | 1 | 36,717 | 63% |
-| Redis 7 | SET | 1 | 57,921 | |
-| redis-from-scratch | GET | 1 | 41,806 | 70% |
-| Redis 7 | GET | 1 | 59,559 | |
-| redis-from-scratch | SET | 16 | 192,678 | 46% |
-| Redis 7 | SET | 16 | 418,410 | |
-| redis-from-scratch | GET | 16 | **573,066** | **105%** |
-| Redis 7 | GET | 16 | 546,448 | |
+| redis-from-scratch | SET | 1 | 38,358 | 65% |
+| Redis 7 | SET | 1 | 59,242 | |
+| redis-from-scratch | GET | 1 | 40,136 | 67% |
+| Redis 7 | GET | 1 | 59,970 | |
+| redis-from-scratch | SET | 16 | 371,747 | 89% |
+| Redis 7 | SET | 16 | 419,287 | |
+| redis-from-scratch | GET | 16 | 552,486 | 92% |
+| Redis 7 | GET | 16 | 598,802 | |
 
 ### SET throughput by appendfsync policy (20,000 requests, no pipelining)
 
 | appendfsync | redis-from-scratch | Redis 7 | vs Redis 7 |
 |---|---:|---:|---:|
-| always | 498 | 11,521 | 4% |
-| everysec | 37,807 | 48,662 | 78% |
-| no | 39,062 | 53,476 | 73% |
+| always | 11,068 | 12,107 | 91% |
+| everysec | 40,816 | 59,347 | 69% |
+| no | 33,168 | 40,241 | 82% |
+
+### Before and after group commit
+
+The first version wrote and fsynced every command on its own, inside the global write lock. Both versions were measured under the same conditions: Redis 7, used as the reference, scored 418,410 and 419,287 SET requests/sec with pipelining in the two runs.
+
+| Scenario | Before | After | Change | vs Redis 7 before → after |
+|---|---:|---:|---:|---:|
+| SET, appendfsync always | 498 | 11,068 | **22×** | 4% → 91% |
+| SET, pipeline 16 | 192,678 | 371,747 | **1.9×** | 46% → 89% |
+| SET, pipeline 1 | 36,717 | 38,358 | unchanged | 63% → 65% |
+| GET, pipeline 16 | 573,066 | 552,486 | unchanged | 105% → 92% |
+
+GET was not touched by this change. Its shift from 105% to 92% of Redis is run-to-run noise, described below.
 
 ## Analysis
 
-**Reads scale with cores.** GET only takes the store's read lock, so many clients can read at the same time. When pipelining removes most of the network round-trip cost, this parallelism lets redis-from-scratch overtake single-threaded Redis on GET.
+**Group commit removes disk I/O from the critical path.** A write command now only encodes itself into an in-memory buffer while it holds the write lock, and receives a sequence number. A single background goroutine takes everything in the buffer, writes it with one `write()` call, fsyncs it if the policy is `always`, and marks that sequence range as durable. While one batch is on its way to disk, the next one is already filling up. In a unit test, 1,000 durable writes from 50 concurrent clients needed only 40 fsyncs.
 
-**Writes are serialized twice.** Every SET holds the router's `writeOrder` mutex, so that the AOF records writes in the same order the store applied them, and then the store's write lock. On top of that, every SET makes its own `write()` system call to the AOF. Redis instead collects the AOF output of a whole event-loop iteration in memory and writes it once. The SET result with pipelining (46%) shows this cost most clearly.
+**Replies wait for durability, per connection.** Each connection has a session that remembers the sequence number of its latest write. The connection's output stream is wrapped in a gate that waits until that sequence is durable before any byte reaches the socket, whether through an explicit flush or an automatic flush of a full buffer. Sixteen pipelined SETs therefore wait once, not sixteen times, and no client ever sees `OK` for a write that is not yet persisted under the configured policy. Redis follows the same rule: it writes the AOF, and fsyncs it under `always`, before sending the replies of an event-loop iteration.
 
-**`appendfsync always` exposes the missing group commit.** redis-from-scratch calls `fsync` inside the write lock for every command, so 50 clients wait in a single queue for the disk: about 500 writes/sec, or roughly 2 ms per `fsync`. Redis fsyncs once per event-loop iteration, and replies to every client in that batch only after the shared `fsync`. It gives the same guarantee (no acknowledged write is lost) at 23× the throughput.
+**Reads scale with cores.** GET only takes the store's read lock, so many clients can read at the same time. With pipelining, this keeps GET close to single-threaded Redis.
 
-**Without pipelining, the network dominates.** Every request is a full round trip through the Docker network, which hides most server-side differences. The 63–70% gap comes from per-request overhead: parsing allocations, goroutine scheduling, and lock handoffs.
+**Without pipelining, per-request overhead dominates.** Every request is a full round trip through the Docker network. A SET also hands off to the flusher goroutine and waits for it, which adds a context switch, so group commit does not help single SETs much. The remaining gap comes from parsing allocations, goroutine scheduling, and lock handoffs.
+
+## Run-to-run variation
+
+The benchmark ran on a laptop, and its performance varied between runs. In one run after the group commit change, Redis itself dropped to 268,817 SET and 310,078 GET requests/sec with pipelining, 35–48% below its usual results, which points to the host throttling. The ratios in that run still matched the conclusions above: SET with pipelining at 87% of Redis, `appendfsync always` at 87%, and GET with pipelining at 106%. The results reported here come from the next run, in which Redis scored within 1% of its numbers from before the change.
+
+Only numbers measured in the same run should be compared. For example, `appendfsync no` coming out slower than `everysec` for both servers is within this noise.
 
 ## Possible improvements
 
-- **Group commit for the AOF.** Buffer the encoded commands from all clients, have one goroutine `write` and `fsync` them in a batch, and reply to clients only after their batch is durable. This should close most of the gap for `always` and pipelined SET.
 - **Sharded store.** Split the map into shards with their own locks, so writes to different keys do not wait for each other.
 - **Fewer allocations in the parser.** Reading a SET currently costs 12 allocations (`BenchmarkReadCommand`). Reusing argument buffers would reduce work for the garbage collector.
+- **Skip the flusher handoff for `everysec` and `no`.** Under these policies a reply only has to wait until the data reaches the operating system, so a connection could write its own batch instead of waiting for another goroutine to do it.
 
 ## Reproduce
 
@@ -81,4 +99,4 @@ Settings can be changed with environment variables:
 RUNS=5 REQUESTS=500000 CLIENTS=100 bash scripts/benchmark.sh
 ```
 
-The script builds the image, starts each server in turn on a private Docker network, and prints the tables above as Markdown. A full run takes about 4–5 minutes.
+The script builds the image, starts each server in turn on a private Docker network, and prints the tables above as Markdown. A full run takes about 3–5 minutes.

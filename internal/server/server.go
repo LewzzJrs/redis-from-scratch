@@ -10,13 +10,16 @@ import (
 	"github.com/LewzzJrs/redis-from-scratch/internal/resp"
 )
 
-type CommandExecutor interface {
+type Session interface {
 	Execute(args []string) resp.Value
+	WaitUntilDurable()
 }
 
+type SessionFactory func() Session
+
 type Server struct {
-	listener net.Listener
-	executor CommandExecutor
+	listener   net.Listener
+	newSession SessionFactory
 
 	mutex       sync.Mutex
 	connections map[net.Conn]struct{}
@@ -24,10 +27,10 @@ type Server struct {
 	handlers    sync.WaitGroup
 }
 
-func New(listener net.Listener, executor CommandExecutor) *Server {
+func New(listener net.Listener, newSession SessionFactory) *Server {
 	return &Server{
 		listener:    listener,
-		executor:    executor,
+		newSession:  newSession,
 		connections: make(map[net.Conn]struct{}),
 	}
 }
@@ -92,11 +95,22 @@ func (s *Server) untrackConnection(conn net.Conn) {
 	delete(s.connections, conn)
 }
 
+type durabilityGate struct {
+	conn    net.Conn
+	session Session
+}
+
+func (g durabilityGate) Write(reply []byte) (int, error) {
+	g.session.WaitUntilDurable()
+	return g.conn.Write(reply)
+}
+
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
+	session := s.newSession()
 	reader := resp.NewReader(conn)
-	writer := resp.NewWriter(conn)
+	writer := resp.NewWriter(durabilityGate{conn: conn, session: session})
 
 	for {
 		args, err := reader.ReadCommand()
@@ -108,7 +122,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		if err := writer.Write(s.executor.Execute(args)); err != nil {
+		if err := writer.Write(session.Execute(args)); err != nil {
 			logConnectionError(conn, "write", err)
 			return
 		}

@@ -11,14 +11,17 @@ import (
 )
 
 type CommandLog interface {
-	Append(args ...string) error
+	Append(args ...string) (sequence uint64, err error)
+	WaitUntilDurable(sequence uint64)
 }
 
 type discardLog struct{}
 
-func (discardLog) Append(args ...string) error {
-	return nil
+func (discardLog) Append(args ...string) (uint64, error) {
+	return 0, nil
 }
+
+func (discardLog) WaitUntilDurable(sequence uint64) {}
 
 type handlerFunc func(args []string) resp.Value
 
@@ -32,7 +35,15 @@ type Router struct {
 	store      *store.Store
 	commandLog CommandLog
 	commands   map[string]commandSpec
-	writeOrder sync.Mutex
+
+	writeOrder           sync.Mutex
+	currentWriteSequence uint64
+}
+
+type Session struct {
+	router                *Router
+	lastWriteSequence     uint64
+	confirmedDurableUntil uint64
 }
 
 func NewRouter(dataStore *store.Store, commandLog CommandLog) *Router {
@@ -55,30 +66,63 @@ func NewRouter(dataStore *store.Store, commandLog CommandLog) *Router {
 	return router
 }
 
+func (r *Router) NewSession() *Session {
+	return &Session{router: r}
+}
+
+func (s *Session) Execute(args []string) resp.Value {
+	reply, writeSequence := s.router.execute(args)
+	if writeSequence > s.lastWriteSequence {
+		s.lastWriteSequence = writeSequence
+	}
+	return reply
+}
+
+func (s *Session) WaitUntilDurable() {
+	if s.lastWriteSequence <= s.confirmedDurableUntil {
+		return
+	}
+	s.router.commandLog.WaitUntilDurable(s.lastWriteSequence)
+	s.confirmedDurableUntil = s.lastWriteSequence
+}
+
 func (r *Router) Execute(args []string) resp.Value {
+	reply, _ := r.execute(args)
+	return reply
+}
+
+func (r *Router) execute(args []string) (resp.Value, uint64) {
 	if len(args) == 0 {
-		return resp.NewError("ERR empty command")
+		return resp.NewError("ERR empty command"), 0
 	}
 
 	spec, known := r.commands[strings.ToUpper(args[0])]
 	if !known {
-		return unknownCommandError(args)
+		return unknownCommandError(args), 0
 	}
 	if !hasValidArity(spec.arity, len(args)) {
-		return wrongArgumentCountError(args[0])
+		return wrongArgumentCountError(args[0]), 0
 	}
 
-	if spec.writesData {
-		r.writeOrder.Lock()
-		defer r.writeOrder.Unlock()
+	if !spec.writesData {
+		return spec.handler(args), 0
 	}
-	return spec.handler(args)
+
+	r.writeOrder.Lock()
+	defer r.writeOrder.Unlock()
+
+	r.currentWriteSequence = 0
+	reply := spec.handler(args)
+	return reply, r.currentWriteSequence
 }
 
 func (r *Router) persist(args ...string) {
-	if err := r.commandLog.Append(args...); err != nil {
+	sequence, err := r.commandLog.Append(args...)
+	if err != nil {
 		log.Printf("failed to append %s to command log: %v", args[0], err)
+		return
 	}
+	r.currentWriteSequence = sequence
 }
 
 func hasValidArity(arity int, argumentCount int) bool {

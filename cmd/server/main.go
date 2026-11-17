@@ -57,7 +57,9 @@ func main() {
 	log.Printf("listening on %s", listener.Addr())
 
 	commandRouter := command.NewRouter(dataStore, commandLog)
-	redisServer := server.New(listener, commandRouter)
+	redisServer := server.New(listener, func() server.Session {
+		return commandRouter.NewSession()
+	})
 
 	shutdownSignal, stopListeningForSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopListeningForSignals()

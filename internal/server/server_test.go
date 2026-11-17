@@ -21,8 +21,11 @@ type testClient struct {
 	reader *resp.Reader
 }
 
-func newTestRouter() *command.Router {
-	return command.NewRouter(store.New(), nil)
+func newTestRouter() SessionFactory {
+	router := command.NewRouter(store.New(), nil)
+	return func() Session {
+		return router.NewSession()
+	}
 }
 
 func startTestServer(t *testing.T) (*Server, string) {
@@ -259,4 +262,46 @@ func TestClientsShareTheSameData(t *testing.T) {
 
 	readerClient.send("GET unknown\r\n")
 	readerClient.expectReply(resp.NewNullBulkString())
+}
+
+type gatedSession struct {
+	released chan struct{}
+}
+
+func (s *gatedSession) Execute(args []string) resp.Value {
+	return resp.NewSimpleString("OK")
+}
+
+func (s *gatedSession) WaitUntilDurable() {
+	<-s.released
+}
+
+func TestRepliesAreHeldUntilWritesAreDurable(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(released) }) }
+
+	testServer := New(listener, func() Session { return &gatedSession{released: released} })
+	go testServer.Serve()
+	t.Cleanup(func() { testServer.Close() })
+	t.Cleanup(release)
+
+	client := dialTestClient(t, listener.Addr().String())
+	client.send("SET k v\r\n")
+
+	client.conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	_, err = client.reader.ReadValue()
+	var networkError net.Error
+	if !errors.As(err, &networkError) || !networkError.Timeout() {
+		t.Fatalf("got %v, want the reply to be held back until the write is durable", err)
+	}
+
+	release()
+	client.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	client.expectReply(resp.NewSimpleString("OK"))
 }

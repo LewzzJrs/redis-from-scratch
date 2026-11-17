@@ -16,7 +16,7 @@ A Redis-compatible key-value server written in Go using only the standard librar
 - **Concurrent clients**, one goroutine per connection, with graceful shutdown on `SIGINT`/`SIGTERM`
 - **Commands:** `PING`, `ECHO`, `SET` (with `EX`, `PX`, `EXAT`, `PXAT`), `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`, `DBSIZE`
 - **Key expiry**, both lazy (checked on every read) and active (a background sweeper using Redis's sampling algorithm)
-- **AOF persistence** with `always`, `everysec`, and `no` fsync policies, crash recovery, and corruption detection
+- **AOF persistence** with group commit, `always`, `everysec`, and `no` fsync policies, crash recovery, and corruption detection
 - **Glob matching** for `KEYS` that follows Redis rules (`*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\` escapes)
 - **9.9 MB Docker image** built on distroless, running as a non-root user
 - **CI** with the race detector, fuzzing, Windows tests, and an end-to-end test using the real `redis-cli`
@@ -111,7 +111,7 @@ flowchart TB
     router -- "reply value" --> writer
     writer -- "RESP reply" --> client
     router -- "write commands" --> aofWriter
-    aofWriter -- "append + fsync" --> file
+    aofWriter -- "batched write + fsync" --> file
     sweeper -- "delete expired sample" --> store
     file -. "read on startup" .-> loader
     loader -. "replay commands" .-> router
@@ -120,11 +120,11 @@ flowchart TB
 | Package | Responsibility |
 |---|---|
 | `cmd/server` | Parses flags, restores the AOF, wires the packages together, handles shutdown signals |
-| `internal/server` | Accepts TCP connections, runs one goroutine per client, tracks connections for graceful shutdown |
+| `internal/server` | Accepts TCP connections, runs one goroutine per client, holds replies until writes are durable, tracks connections for graceful shutdown |
 | `internal/resp` | Reads and writes the Redis Serialization Protocol |
-| `internal/command` | Command table with arity checks, the command handlers, and write ordering for the AOF |
+| `internal/command` | Command table with arity checks, the command handlers, write ordering for the AOF, and per-connection sessions |
 | `internal/store` | Thread-safe key-value map with expiry deadlines and the background sweeper |
-| `internal/aof` | Append-only file writer with fsync policies, and the loader that replays it |
+| `internal/aof` | Append-only file writer with group commit and fsync policies, and the loader that replays it |
 | `internal/glob` | Redis-compatible glob matching for `KEYS` |
 
 Each package has a single job and depends only on the ones below it. The store knows nothing about RESP or TCP, and the server knows nothing about individual commands.
@@ -154,22 +154,24 @@ Each key stores an absolute deadline instead of a countdown, so checking expiry 
 Writing commands to a file is easy. Making sure the file rebuilds exactly the same state after a crash is the hard part.
 
 - **Write order must match apply order.** If two clients `SET` the same key, the order in the file must equal the order applied in memory. Write commands therefore hold an ordering lock while they update the store and append to the AOF. Reads skip this lock and stay parallel.
+- **Group commit keeps the disk out of the lock.** Inside the lock, a write only encodes itself into an in-memory buffer and gets a sequence number. One background goroutine writes the whole buffer with a single `write()` and, under `appendfsync always`, a single `fsync`, then marks that range as durable. Each connection's output passes through a gate that waits until its latest write is durable before any reply reaches the socket, so a client never sees `OK` for data that could still be lost. In a test, 1,000 durable writes from 50 clients needed 40 fsyncs instead of 1,000, and `appendfsync always` became 22× faster.
 - **Replay must be deterministic.** `SET key value EX 60` is recorded as `SET key value PXAT <absolute ms>`, so a key expires at the same moment no matter when the server restarts. `INCR` is recorded as a `SET` of its result, because replaying `INCR` on a key that expired in the meantime would restart the counter without its TTL.
 - **Crashes are recovered, corruption is refused.** If the last command was cut off mid-write, the loader truncates the file to the last complete command, logs a warning, and starts. If a damaged command is followed by valid ones, the server refuses to start rather than silently lose data, and reports the byte offset.
 - **One code path for everything.** The loader replays commands through the same router that serves clients, with logging turned off, so validation is identical and replay never writes the commands back to the file.
 
 ## Benchmarks
 
-Measured with `redis-benchmark` 7.4 against Redis 7.4.12, both with AOF enabled (`appendfsync everysec`), on the same Docker network: 50 clients, 200,000 requests, median of 3 runs, on an AMD Ryzen 7 4800H.
+Measured with `redis-benchmark` 7.4 against Redis 7.4.12, both with AOF enabled (`appendfsync everysec` unless noted), on the same Docker network: 50 clients, 200,000 requests, median of 3 runs, on an AMD Ryzen 7 4800H.
 
 | Command | Pipeline | redis-from-scratch | Redis 7.4 | Relative |
 |---|---:|---:|---:|---:|
-| SET | 1 | 36,717 ops/sec | 57,921 ops/sec | 63% |
-| GET | 1 | 41,806 ops/sec | 59,559 ops/sec | 70% |
-| SET | 16 | 192,678 ops/sec | 418,410 ops/sec | 46% |
-| GET | 16 | **573,066 ops/sec** | 546,448 ops/sec | **105%** |
+| SET | 1 | 38,358 ops/sec | 59,242 ops/sec | 65% |
+| GET | 1 | 40,136 ops/sec | 59,970 ops/sec | 67% |
+| SET | 16 | 371,747 ops/sec | 419,287 ops/sec | 89% |
+| GET | 16 | 552,486 ops/sec | 598,802 ops/sec | 92% |
+| SET, `appendfsync always` | 1 | 11,068 ops/sec | 12,107 ops/sec | 91% |
 
-Reads scale across cores under a read lock, which is why pipelined GET is on par with single-threaded Redis. Writes are serialized and make one `write()` call per command, and `appendfsync always` is 23× slower than Redis because it has no group commit. See [docs/benchmarks.md](docs/benchmarks.md) for the full results, the fsync comparison, the analysis, and how to reproduce them with `bash scripts/benchmark.sh`.
+The first version fsynced every command on its own and reached only 4% of Redis with `appendfsync always`, and 46% for pipelined SET. Group commit brought these to 91% and 89%. Without pipelining, per-request overhead and the network round trip dominate. See [docs/benchmarks.md](docs/benchmarks.md) for the before-and-after comparison, run-to-run variation, the analysis, and how to reproduce the results with `bash scripts/benchmark.sh`.
 
 ## Testing
 
@@ -181,10 +183,10 @@ go test ./...
 |---|---:|
 | `internal/glob` | 100% |
 | `internal/store` | 100% |
-| `internal/command` | 99.0% |
+| `internal/command` | 99.1% |
 | `internal/resp` | 98.5% |
-| `internal/aof` | 92.8% |
-| `internal/server` | 85.7% |
+| `internal/aof` | 90.1% |
+| `internal/server` | 86.4% |
 
 The test suite includes:
 
@@ -199,7 +201,6 @@ CI runs on every push: formatting, `go vet`, tests with `-race` on Linux, tests 
 
 - Only the string type is supported. Lists, hashes, sets, and sorted sets are not.
 - The AOF grows forever. There is no rewrite or compaction like `BGREWRITEAOF`.
-- `appendfsync always` fsyncs once per command instead of using group commit.
 - If writing to the AOF fails, the server logs the error and keeps serving. Redis rejects further writes with a `MISCONF` error instead.
 - No authentication, TLS, replication, transactions, or pub/sub.
 

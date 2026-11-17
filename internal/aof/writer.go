@@ -34,13 +34,21 @@ func ParseFsyncPolicy(text string) (FsyncPolicy, error) {
 }
 
 type Writer struct {
-	mutex             sync.Mutex
-	file              *os.File
-	policy            FsyncPolicy
-	encodedCommand    bytes.Buffer
-	encoder           *resp.Writer
-	hasUnsyncedWrites bool
+	file   *os.File
+	policy FsyncPolicy
 
+	mutex             sync.Mutex
+	batchReady        *sync.Cond
+	batchDurable      *sync.Cond
+	pending           bytes.Buffer
+	encoder           *resp.Writer
+	appendedSequence  uint64
+	durableSequence   uint64
+	flushedBatchCount uint64
+	hasUnsyncedWrites bool
+	closing           bool
+
+	flusherFinished chan struct{}
 	stopSyncing     chan struct{}
 	syncingFinished chan struct{}
 	closeOnce       sync.Once
@@ -60,11 +68,15 @@ func openWithSyncInterval(path string, policy FsyncPolicy, syncInterval time.Dur
 	writer := &Writer{
 		file:            file,
 		policy:          policy,
+		flusherFinished: make(chan struct{}),
 		stopSyncing:     make(chan struct{}),
 		syncingFinished: make(chan struct{}),
 	}
-	writer.encoder = resp.NewWriter(&writer.encodedCommand)
+	writer.batchReady = sync.NewCond(&writer.mutex)
+	writer.batchDurable = sync.NewCond(&writer.mutex)
+	writer.encoder = resp.NewWriter(&writer.pending)
 
+	go writer.flushBatches()
 	if policy == FsyncEverySecond {
 		go writer.syncPeriodically(syncInterval)
 	} else {
@@ -73,63 +85,110 @@ func openWithSyncInterval(path string, policy FsyncPolicy, syncInterval time.Dur
 	return writer, nil
 }
 
-func (w *Writer) Append(args ...string) error {
+func (w *Writer) Append(args ...string) (uint64, error) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
-	if w.file == nil {
-		return ErrWriterClosed
+	if w.closing {
+		return 0, ErrWriterClosed
 	}
 
-	w.encodedCommand.Reset()
 	w.encoder.Write(resp.NewCommand(args...))
 	if err := w.encoder.Flush(); err != nil {
-		return fmt.Errorf("encode command: %w", err)
+		return 0, fmt.Errorf("encode command: %w", err)
 	}
 
-	if _, err := w.file.Write(w.encodedCommand.Bytes()); err != nil {
-		return fmt.Errorf("write aof file: %w", err)
-	}
-
-	switch w.policy {
-	case FsyncAlways:
-		return w.file.Sync()
-	case FsyncEverySecond:
-		w.hasUnsyncedWrites = true
-	}
-	return nil
+	w.appendedSequence++
+	w.batchReady.Signal()
+	return w.appendedSequence, nil
 }
 
-func (w *Writer) Sync() error {
+func (w *Writer) WaitUntilDurable(sequence uint64) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
-	return w.syncLocked()
+
+	for w.durableSequence < sequence {
+		w.batchDurable.Wait()
+	}
 }
 
 func (w *Writer) Close() error {
 	w.closeOnce.Do(func() {
+		w.mutex.Lock()
+		w.closing = true
+		w.batchReady.Broadcast()
+		w.mutex.Unlock()
+
+		<-w.flusherFinished
 		close(w.stopSyncing)
 		<-w.syncingFinished
 
-		w.mutex.Lock()
-		defer w.mutex.Unlock()
-
-		syncError := w.file.Sync()
-		closeError := w.file.Close()
-		w.file = nil
-		w.closeError = errors.Join(syncError, closeError)
+		w.closeError = errors.Join(w.file.Sync(), w.file.Close())
 	})
 	return w.closeError
 }
 
-func (w *Writer) syncLocked() error {
-	if w.file == nil || !w.hasUnsyncedWrites {
+func (w *Writer) flushBatches() {
+	defer close(w.flusherFinished)
+
+	var batch []byte
+	for {
+		w.mutex.Lock()
+		for w.pending.Len() == 0 && !w.closing {
+			w.batchReady.Wait()
+		}
+		if w.pending.Len() == 0 {
+			w.mutex.Unlock()
+			return
+		}
+
+		batch = append(batch[:0], w.pending.Bytes()...)
+		w.pending.Reset()
+		lastSequenceInBatch := w.appendedSequence
+		w.mutex.Unlock()
+
+		if err := w.persistBatch(batch); err != nil {
+			log.Printf("aof batch of %d byte(s) was not persisted: %v", len(batch), err)
+		}
+
+		w.mutex.Lock()
+		w.durableSequence = lastSequenceInBatch
+		w.flushedBatchCount++
+		if w.policy == FsyncEverySecond {
+			w.hasUnsyncedWrites = true
+		}
+		w.batchDurable.Broadcast()
+		w.mutex.Unlock()
+	}
+}
+
+func (w *Writer) persistBatch(batch []byte) error {
+	if _, err := w.file.Write(batch); err != nil {
+		return fmt.Errorf("write aof file: %w", err)
+	}
+	if w.policy == FsyncAlways {
+		if err := w.file.Sync(); err != nil {
+			return fmt.Errorf("fsync aof file: %w", err)
+		}
+	}
+	return nil
+}
+
+func (w *Writer) syncIfNeeded() error {
+	w.mutex.Lock()
+	needsSync := w.hasUnsyncedWrites
+	w.hasUnsyncedWrites = false
+	w.mutex.Unlock()
+
+	if !needsSync {
 		return nil
 	}
 	if err := w.file.Sync(); err != nil {
+		w.mutex.Lock()
+		w.hasUnsyncedWrites = true
+		w.mutex.Unlock()
 		return fmt.Errorf("fsync aof file: %w", err)
 	}
-	w.hasUnsyncedWrites = false
 	return nil
 }
 
@@ -144,7 +203,7 @@ func (w *Writer) syncPeriodically(interval time.Duration) {
 		case <-w.stopSyncing:
 			return
 		case <-ticker.C:
-			if err := w.Sync(); err != nil {
+			if err := w.syncIfNeeded(); err != nil {
 				log.Printf("background aof fsync failed: %v", err)
 			}
 		}
