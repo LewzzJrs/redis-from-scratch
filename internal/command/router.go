@@ -27,6 +27,10 @@ func NewRouter(dataStore *store.Store) *Router {
 		"ECHO":   {arity: 2, handler: router.echo},
 		"SET":    {arity: -3, handler: router.set},
 		"GET":    {arity: 2, handler: router.get},
+		"INCR":   {arity: 2, handler: router.incr},
+		"DEL":    {arity: -2, handler: router.del},
+		"EXISTS": {arity: -2, handler: router.exists},
+		"KEYS":   {arity: 2, handler: router.keys},
 		"DBSIZE": {arity: 1, handler: router.dbsize},
 	}
 	return router

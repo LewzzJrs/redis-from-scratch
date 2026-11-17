@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/LewzzJrs/redis-from-scratch/internal/resp"
+	"github.com/LewzzJrs/redis-from-scratch/internal/store"
 )
 
 var (
 	errSyntax            = errors.New("ERR syntax error")
 	errNotAnInteger      = errors.New("ERR value is not an integer or out of range")
 	errInvalidExpireTime = errors.New("ERR invalid expire time in 'set' command")
+	errIncrementOverflow = errors.New("ERR increment or decrement would overflow")
 )
 
 func (r *Router) set(args []string) resp.Value {
@@ -38,6 +40,19 @@ func (r *Router) get(args []string) resp.Value {
 		return resp.NewNullBulkString()
 	}
 	return resp.NewBulkString(value)
+}
+
+func (r *Router) incr(args []string) resp.Value {
+	nextNumber, err := r.store.Increment(args[1], 1)
+	switch {
+	case errors.Is(err, store.ErrNotInteger):
+		return resp.NewError(errNotAnInteger.Error())
+	case errors.Is(err, store.ErrIncrementOverflow):
+		return resp.NewError(errIncrementOverflow.Error())
+	case err != nil:
+		return resp.NewError("ERR " + err.Error())
+	}
+	return resp.NewInteger(nextNumber)
 }
 
 func parseSetOptions(options []string) (time.Duration, error) {

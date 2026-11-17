@@ -1,8 +1,16 @@
 package store
 
 import (
+	"errors"
+	"math"
+	"strconv"
 	"sync"
 	"time"
+)
+
+var (
+	ErrNotInteger        = errors.New("value is not an integer")
+	ErrIncrementOverflow = errors.New("increment would overflow")
 )
 
 type entry struct {
@@ -66,6 +74,91 @@ func (s *Store) SetWithExpiry(key string, value string, timeToLive time.Duration
 
 	s.data[key] = entry{value: value, expiresAt: s.now().Add(timeToLive)}
 	s.keysWithExpiry[key] = struct{}{}
+}
+
+func (s *Store) Delete(keys ...string) int {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	now := s.now()
+	deletedCount := 0
+	for _, key := range keys {
+		storedEntry, found := s.data[key]
+		if !found {
+			continue
+		}
+		if !storedEntry.isExpiredAt(now) {
+			deletedCount++
+		}
+		s.deleteKey(key)
+	}
+	return deletedCount
+}
+
+func (s *Store) Exists(key string) bool {
+	_, found := s.Get(key)
+	return found
+}
+
+func (s *Store) Keys(matches func(key string) bool) []string {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	now := s.now()
+	matchingKeys := []string{}
+	for key, storedEntry := range s.data {
+		if storedEntry.isExpiredAt(now) {
+			continue
+		}
+		if matches(key) {
+			matchingKeys = append(matchingKeys, key)
+		}
+	}
+	return matchingKeys
+}
+
+func (s *Store) Increment(key string, delta int64) (int64, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	storedEntry, found := s.data[key]
+	if found && storedEntry.isExpiredAt(s.now()) {
+		s.deleteKey(key)
+		storedEntry, found = entry{}, false
+	}
+
+	currentNumber := int64(0)
+	if found {
+		parsedNumber, isInteger := parseStrictInteger(storedEntry.value)
+		if !isInteger {
+			return 0, ErrNotInteger
+		}
+		currentNumber = parsedNumber
+	}
+
+	if wouldOverflow(currentNumber, delta) {
+		return 0, ErrIncrementOverflow
+	}
+
+	nextNumber := currentNumber + delta
+	storedEntry.value = strconv.FormatInt(nextNumber, 10)
+	s.data[key] = storedEntry
+	return nextNumber, nil
+}
+
+func parseStrictInteger(text string) (int64, bool) {
+	number, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || strconv.FormatInt(number, 10) != text {
+		return 0, false
+	}
+	return number, true
+}
+
+func wouldOverflow(current int64, delta int64) bool {
+	if delta > 0 {
+		return current > math.MaxInt64-delta
+	}
+	return current < math.MinInt64-delta
 }
 
 func (s *Store) Len() int {

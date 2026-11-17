@@ -2,6 +2,7 @@ package command
 
 import (
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -196,4 +197,98 @@ func TestDbsizeCountsKeysStillInMemory(t *testing.T) {
 	expectReply(t, router, []string{"DBSIZE"}, resp.NewInteger(1))
 
 	expectReply(t, router, []string{"DBSIZE", "extra"}, resp.NewError("ERR wrong number of arguments for 'dbsize' command"))
+}
+
+func TestDelAndExists(t *testing.T) {
+	router := newTestRouter()
+	expectReply(t, router, []string{"SET", "a", "1"}, resp.NewSimpleString("OK"))
+	expectReply(t, router, []string{"SET", "b", "2"}, resp.NewSimpleString("OK"))
+
+	expectReply(t, router, []string{"EXISTS", "a"}, resp.NewInteger(1))
+	expectReply(t, router, []string{"EXISTS", "a", "b", "missing", "a"}, resp.NewInteger(3))
+
+	expectReply(t, router, []string{"DEL", "a", "missing"}, resp.NewInteger(1))
+	expectReply(t, router, []string{"DEL", "a"}, resp.NewInteger(0))
+	expectReply(t, router, []string{"EXISTS", "a", "b"}, resp.NewInteger(1))
+	expectReply(t, router, []string{"GET", "a"}, resp.NewNullBulkString())
+
+	expectReply(t, router, []string{"DEL"}, resp.NewError("ERR wrong number of arguments for 'del' command"))
+	expectReply(t, router, []string{"EXISTS"}, resp.NewError("ERR wrong number of arguments for 'exists' command"))
+}
+
+func TestExpiredKeysDoNotExist(t *testing.T) {
+	router, clock := newRouterWithFakeClock()
+	expectReply(t, router, []string{"SET", "temp", "x", "PX", "100"}, resp.NewSimpleString("OK"))
+	clock.Advance(time.Second)
+
+	expectReply(t, router, []string{"EXISTS", "temp"}, resp.NewInteger(0))
+	expectReply(t, router, []string{"DEL", "temp"}, resp.NewInteger(0))
+}
+
+func keysReply(t *testing.T, router *Router, pattern string) []string {
+	t.Helper()
+	reply := router.Execute([]string{"KEYS", pattern})
+	if reply.Type != resp.Array {
+		t.Fatalf("KEYS %s: got %#v, want array", pattern, reply)
+	}
+
+	keys := make([]string, len(reply.Items))
+	for index, item := range reply.Items {
+		keys[index] = item.Text
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+func TestKeysMatchesGlobPatterns(t *testing.T) {
+	router, clock := newRouterWithFakeClock()
+	for _, key := range []string{"user:1", "user:2", "user:10", "session:abc", "hello", "hallo"} {
+		expectReply(t, router, []string{"SET", key, "v"}, resp.NewSimpleString("OK"))
+	}
+	expectReply(t, router, []string{"SET", "user:expired", "v", "PX", "10"}, resp.NewSimpleString("OK"))
+	clock.Advance(time.Second)
+
+	testCases := []struct {
+		pattern  string
+		expected []string
+	}{
+		{"*", []string{"hallo", "hello", "session:abc", "user:1", "user:10", "user:2"}},
+		{"user:*", []string{"user:1", "user:10", "user:2"}},
+		{"user:?", []string{"user:1", "user:2"}},
+		{"h[ae]llo", []string{"hallo", "hello"}},
+		{"h[^e]llo", []string{"hallo"}},
+		{"nothing*", []string{}},
+	}
+
+	for _, testCase := range testCases {
+		if got := keysReply(t, router, testCase.pattern); !slices.Equal(got, testCase.expected) {
+			t.Errorf("KEYS %s: got %q, want %q", testCase.pattern, got, testCase.expected)
+		}
+	}
+
+	expectReply(t, router, []string{"KEYS"}, resp.NewError("ERR wrong number of arguments for 'keys' command"))
+}
+
+func TestIncr(t *testing.T) {
+	router := newTestRouter()
+
+	expectReply(t, router, []string{"INCR", "visits"}, resp.NewInteger(1))
+	expectReply(t, router, []string{"INCR", "visits"}, resp.NewInteger(2))
+	expectReply(t, router, []string{"GET", "visits"}, resp.NewBulkString("2"))
+
+	expectReply(t, router, []string{"SET", "negative", "-10"}, resp.NewSimpleString("OK"))
+	expectReply(t, router, []string{"INCR", "negative"}, resp.NewInteger(-9))
+}
+
+func TestIncrErrors(t *testing.T) {
+	router := newTestRouter()
+
+	expectReply(t, router, []string{"SET", "name", "redis"}, resp.NewSimpleString("OK"))
+	expectReply(t, router, []string{"INCR", "name"}, resp.NewError("ERR value is not an integer or out of range"))
+
+	expectReply(t, router, []string{"SET", "big", "9223372036854775807"}, resp.NewSimpleString("OK"))
+	expectReply(t, router, []string{"INCR", "big"}, resp.NewError("ERR increment or decrement would overflow"))
+
+	expectReply(t, router, []string{"INCR"}, resp.NewError("ERR wrong number of arguments for 'incr' command"))
+	expectReply(t, router, []string{"INCR", "a", "b"}, resp.NewError("ERR wrong number of arguments for 'incr' command"))
 }
