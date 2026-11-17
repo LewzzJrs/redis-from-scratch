@@ -10,8 +10,13 @@ import (
 	"github.com/LewzzJrs/redis-from-scratch/internal/resp"
 )
 
+type CommandExecutor interface {
+	Execute(args []string) resp.Value
+}
+
 type Server struct {
 	listener net.Listener
+	executor CommandExecutor
 
 	mutex       sync.Mutex
 	connections map[net.Conn]struct{}
@@ -19,9 +24,10 @@ type Server struct {
 	handlers    sync.WaitGroup
 }
 
-func New(listener net.Listener) *Server {
+func New(listener net.Listener, executor CommandExecutor) *Server {
 	return &Server{
 		listener:    listener,
+		executor:    executor,
 		connections: make(map[net.Conn]struct{}),
 	}
 }
@@ -102,7 +108,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		if err := writer.Write(executeCommand(args)); err != nil {
+		if err := writer.Write(s.executor.Execute(args)); err != nil {
 			logConnectionError(conn, "write", err)
 			return
 		}

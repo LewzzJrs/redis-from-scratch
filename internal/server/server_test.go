@@ -10,13 +10,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LewzzJrs/redis-from-scratch/internal/command"
 	"github.com/LewzzJrs/redis-from-scratch/internal/resp"
+	"github.com/LewzzJrs/redis-from-scratch/internal/store"
 )
 
 type testClient struct {
 	t      *testing.T
 	conn   net.Conn
 	reader *resp.Reader
+}
+
+func newTestRouter() *command.Router {
+	return command.NewRouter(store.New())
 }
 
 func startTestServer(t *testing.T) (*Server, string) {
@@ -27,7 +33,7 @@ func startTestServer(t *testing.T) (*Server, string) {
 		t.Fatalf("listen: %v", err)
 	}
 
-	testServer := New(listener)
+	testServer := New(listener, newTestRouter())
 	go testServer.Serve()
 	t.Cleanup(func() { testServer.Close() })
 
@@ -204,7 +210,7 @@ func TestCloseDisconnectsClientsAndStopsServe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	testServer := New(listener)
+	testServer := New(listener, newTestRouter())
 
 	serveResult := make(chan error, 1)
 	go func() {
@@ -238,4 +244,19 @@ func TestCloseDisconnectsClientsAndStopsServe(t *testing.T) {
 	if connected := testServer.ConnectedClients(); connected != 0 {
 		t.Fatalf("got %d connected clients after close, want 0", connected)
 	}
+}
+
+func TestClientsShareTheSameData(t *testing.T) {
+	_, address := startTestServer(t)
+
+	writerClient := dialTestClient(t, address)
+	writerClient.send("*3\r\n$3\r\nSET\r\n$8\r\nlanguage\r\n$2\r\nGo\r\n")
+	writerClient.expectReply(resp.NewSimpleString("OK"))
+
+	readerClient := dialTestClient(t, address)
+	readerClient.send("*2\r\n$3\r\nGET\r\n$8\r\nlanguage\r\n")
+	readerClient.expectReply(resp.NewBulkString("Go"))
+
+	readerClient.send("GET unknown\r\n")
+	readerClient.expectReply(resp.NewNullBulkString())
 }

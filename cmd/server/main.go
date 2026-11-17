@@ -10,7 +10,9 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/LewzzJrs/redis-from-scratch/internal/command"
 	"github.com/LewzzJrs/redis-from-scratch/internal/server"
+	"github.com/LewzzJrs/redis-from-scratch/internal/store"
 )
 
 func main() {
@@ -24,7 +26,9 @@ func main() {
 	}
 	log.Printf("listening on %s", listener.Addr())
 
-	redisServer := server.New(listener)
+	dataStore := store.New()
+	commandRouter := command.NewRouter(dataStore)
+	redisServer := server.New(listener, commandRouter)
 
 	shutdownSignal, stopListeningForSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopListeningForSignals()
