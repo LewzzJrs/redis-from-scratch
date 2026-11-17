@@ -65,7 +65,3 @@ func unknownCommandError(args []string) resp.Value {
 func wrongArgumentCountError(commandName string) resp.Value {
 	return resp.NewError(fmt.Sprintf("ERR wrong number of arguments for '%s' command", strings.ToLower(commandName)))
 }
-
-func syntaxError() resp.Value {
-	return resp.NewError("ERR syntax error")
-}
