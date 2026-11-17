@@ -27,6 +27,9 @@ func main() {
 	log.Printf("listening on %s", listener.Addr())
 
 	dataStore := store.New()
+	expirySweeper := store.StartSweeper(dataStore, store.DefaultSweeperConfig())
+	defer expirySweeper.Stop()
+
 	commandRouter := command.NewRouter(dataStore)
 	redisServer := server.New(listener, commandRouter)
 

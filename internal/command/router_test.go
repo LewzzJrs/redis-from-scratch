@@ -180,3 +180,20 @@ func TestSetExpiryOptionErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestDbsizeCountsKeysStillInMemory(t *testing.T) {
+	router, clock := newRouterWithFakeClock()
+
+	expectReply(t, router, []string{"DBSIZE"}, resp.NewInteger(0))
+	expectReply(t, router, []string{"SET", "a", "1"}, resp.NewSimpleString("OK"))
+	expectReply(t, router, []string{"SET", "b", "2", "PX", "100"}, resp.NewSimpleString("OK"))
+	expectReply(t, router, []string{"DBSIZE"}, resp.NewInteger(2))
+
+	clock.Advance(time.Second)
+	expectReply(t, router, []string{"DBSIZE"}, resp.NewInteger(2))
+
+	expectReply(t, router, []string{"GET", "b"}, resp.NewNullBulkString())
+	expectReply(t, router, []string{"DBSIZE"}, resp.NewInteger(1))
+
+	expectReply(t, router, []string{"DBSIZE", "extra"}, resp.NewError("ERR wrong number of arguments for 'dbsize' command"))
+}

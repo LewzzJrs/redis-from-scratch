@@ -19,9 +19,10 @@ func (e entry) isExpiredAt(moment time.Time) bool {
 }
 
 type Store struct {
-	mutex sync.RWMutex
-	data  map[string]entry
-	now   func() time.Time
+	mutex          sync.RWMutex
+	data           map[string]entry
+	keysWithExpiry map[string]struct{}
+	now            func() time.Time
 }
 
 func New() *Store {
@@ -30,8 +31,9 @@ func New() *Store {
 
 func NewWithClock(now func() time.Time) *Store {
 	return &Store{
-		data: make(map[string]entry),
-		now:  now,
+		data:           make(map[string]entry),
+		keysWithExpiry: make(map[string]struct{}),
+		now:            now,
 	}
 }
 
@@ -55,6 +57,7 @@ func (s *Store) Set(key string, value string) {
 	defer s.mutex.Unlock()
 
 	s.data[key] = entry{value: value}
+	delete(s.keysWithExpiry, key)
 }
 
 func (s *Store) SetWithExpiry(key string, value string, timeToLive time.Duration) {
@@ -62,6 +65,32 @@ func (s *Store) SetWithExpiry(key string, value string, timeToLive time.Duration
 	defer s.mutex.Unlock()
 
 	s.data[key] = entry{value: value, expiresAt: s.now().Add(timeToLive)}
+	s.keysWithExpiry[key] = struct{}{}
+}
+
+func (s *Store) Len() int {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return len(s.data)
+}
+
+func (s *Store) DeleteExpiredSample(sampleSize int) (sampledCount int, deletedCount int) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	now := s.now()
+	for key := range s.keysWithExpiry {
+		if sampledCount == sampleSize {
+			break
+		}
+		sampledCount++
+
+		if s.data[key].isExpiredAt(now) {
+			s.deleteKey(key)
+			deletedCount++
+		}
+	}
+	return sampledCount, deletedCount
 }
 
 func (s *Store) deleteIfExpired(key string) {
@@ -70,6 +99,11 @@ func (s *Store) deleteIfExpired(key string) {
 
 	storedEntry, found := s.data[key]
 	if found && storedEntry.isExpiredAt(s.now()) {
-		delete(s.data, key)
+		s.deleteKey(key)
 	}
+}
+
+func (s *Store) deleteKey(key string) {
+	delete(s.data, key)
+	delete(s.keysWithExpiry, key)
 }

@@ -23,10 +23,11 @@ type Router struct {
 func NewRouter(dataStore *store.Store) *Router {
 	router := &Router{store: dataStore}
 	router.commands = map[string]commandSpec{
-		"PING": {arity: -1, handler: router.ping},
-		"ECHO": {arity: 2, handler: router.echo},
-		"SET":  {arity: -3, handler: router.set},
-		"GET":  {arity: 2, handler: router.get},
+		"PING":   {arity: -1, handler: router.ping},
+		"ECHO":   {arity: 2, handler: router.echo},
+		"SET":    {arity: -3, handler: router.set},
+		"GET":    {arity: 2, handler: router.get},
+		"DBSIZE": {arity: 1, handler: router.dbsize},
 	}
 	return router
 }
