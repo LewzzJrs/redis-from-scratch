@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -243,5 +245,171 @@ func TestWriteThenReadRoundTrip(t *testing.T) {
 		if !reflect.DeepEqual(decoded, original) {
 			t.Fatalf("round trip changed value: got %#v, want %#v", decoded, original)
 		}
+	}
+}
+
+func TestProtocolErrorMessage(t *testing.T) {
+	_, err := readerFor("$abc\r\n").ReadValue()
+	if err == nil || err.Error() != `protocol error: invalid bulk length "abc"` {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestReadCommandTreatsNullArrayAsEmptyCommand(t *testing.T) {
+	args, err := readerFor("*-1\r\n").ReadCommand()
+	if err != nil || len(args) != 0 {
+		t.Fatalf("got (%q, %v), want empty command", args, err)
+	}
+}
+
+func TestBufferedReportsPipelinedBytes(t *testing.T) {
+	reader := readerFor("PING\r\nPING\r\n")
+
+	if _, err := reader.ReadCommand(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if pending := reader.Buffered(); pending != len("PING\r\n") {
+		t.Fatalf("got %d buffered bytes, want %d", pending, len("PING\r\n"))
+	}
+
+	if _, err := reader.ReadCommand(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if pending := reader.Buffered(); pending != 0 {
+		t.Fatalf("got %d buffered bytes, want 0", pending)
+	}
+}
+
+type brokenDestination struct{}
+
+func (brokenDestination) Write([]byte) (int, error) {
+	return 0, errors.New("connection reset")
+}
+
+func TestWriterReportsDestinationErrorOnFlush(t *testing.T) {
+	writer := NewWriter(brokenDestination{})
+	writer.Write(NewBulkString("hello"))
+
+	if err := writer.Flush(); err == nil {
+		t.Fatal("expected flush to report the destination error")
+	}
+}
+
+func FuzzReadCommand(f *testing.F) {
+	seeds := []string{
+		"*1\r\n$4\r\nPING\r\n",
+		"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n",
+		"PING\r\n",
+		"SET a b\n",
+		"*2\r\n$3\r\nGET\r\n$-1\r\n",
+		"*1\r\n*1\r\n:1\r\n",
+		"$5\r\nhello\r\n",
+		"*-1\r\n",
+		"",
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, input string) {
+		args, err := readerFor(input).ReadCommand()
+		if err != nil {
+			return
+		}
+
+		decodedAgain, err := readerFor(encode(t, NewCommand(args...))).ReadCommand()
+		if err != nil {
+			t.Fatalf("re-encoded command %q could not be read back: %v", args, err)
+		}
+		if !reflect.DeepEqual(decodedAgain, args) {
+			t.Fatalf("round trip changed command: got %q, want %q", decodedAgain, args)
+		}
+	})
+}
+
+func FuzzBulkStringRoundTrip(f *testing.F) {
+	for _, seed := range []string{"", "hello", "a\r\nb", "\x00\xff", "$3\r\n*1\r\n"} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, payload string) {
+		decoded, err := readerFor(encode(t, NewBulkString(payload))).ReadValue()
+		if err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if decoded.Type != BulkString || decoded.Text != payload {
+			t.Fatalf("got %#v, want bulk string %q", decoded, payload)
+		}
+	})
+}
+
+func BenchmarkReadCommand(b *testing.B) {
+	command := encodeForBenchmark(NewCommand("SET", "user:1000", strings.Repeat("x", 64)))
+	source := strings.NewReader("")
+	reader := NewReader(source)
+
+	b.SetBytes(int64(len(command)))
+	b.ReportAllocs()
+	for b.Loop() {
+		source.Reset(command)
+		reader.reader.Reset(source)
+		if _, err := reader.ReadCommand(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWriteBulkString(b *testing.B) {
+	writer := NewWriter(io.Discard)
+	value := NewBulkString(strings.Repeat("x", 64))
+
+	b.ReportAllocs()
+	for b.Loop() {
+		writer.Write(value)
+	}
+	writer.Flush()
+}
+
+func encodeForBenchmark(value Value) string {
+	var output bytes.Buffer
+	writer := NewWriter(&output)
+	writer.Write(value)
+	writer.Flush()
+	return output.String()
+}
+
+func TestHugeDeclaredBulkLengthDoesNotAllocateUpFront(t *testing.T) {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	_, err := readerFor("*1\r\n$536870912\r\nonly a few bytes arrived").ReadCommand()
+
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("got %v, want io.ErrUnexpectedEOF", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8*1024*1024 {
+		t.Fatalf("allocated %d MB for a payload that never arrived", allocated/(1024*1024))
+	}
+}
+func TestLargeBulkStringIsReadCompletely(t *testing.T) {
+	payload := strings.Repeat("0123456789", 50_000)
+	input := "*2\r\n$4\r\nECHO\r\n$" + strconv.Itoa(len(payload)) + "\r\n" + payload + "\r\n"
+
+	args, err := readerFor(input).ReadCommand()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(args) != 2 || args[1] != payload {
+		t.Fatalf("large payload was not read back intact (got %d bytes)", len(args[1]))
+	}
+
+	_, err = readerFor("$" + strconv.Itoa(len(payload)) + "\r\n" + payload + "XY").ReadValue()
+	expectProtocolError(t, err)
+
+	_, err = readerFor("$" + strconv.Itoa(len(payload)) + "\r\n" + payload[:1000]).ReadValue()
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated large payload: got %v, want io.ErrUnexpectedEOF", err)
 	}
 }

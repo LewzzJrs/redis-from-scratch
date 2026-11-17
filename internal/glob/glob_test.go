@@ -75,3 +75,62 @@ func TestMatchStaysFastOnPathologicalPattern(t *testing.T) {
 		t.Fatalf("matching took %v, want well under a second", elapsed)
 	}
 }
+
+func escapeGlob(text string) string {
+	var escaped strings.Builder
+	for index := range len(text) {
+		if strings.IndexByte(`*?[]\`, text[index]) >= 0 {
+			escaped.WriteByte('\\')
+		}
+		escaped.WriteByte(text[index])
+	}
+	return escaped.String()
+}
+
+func FuzzMatch(f *testing.F) {
+	seeds := [][2]string{
+		{"*", "anything"},
+		{"h?llo", "hello"},
+		{"h[a-c]llo", "hbllo"},
+		{"[^e]", "x"},
+		{"\\*", "*"},
+		{"[abc", "b"},
+		{"a*b*c", "aXbYc"},
+	}
+	for _, seed := range seeds {
+		f.Add(seed[0], seed[1])
+	}
+
+	f.Fuzz(func(t *testing.T, pattern string, text string) {
+		Match(pattern, text)
+
+		if !Match(escapeGlob(text), text) {
+			t.Fatalf("escaped text %q should match itself", text)
+		}
+		if !Match("*", text) {
+			t.Fatalf("* should match %q", text)
+		}
+		if !Match("*"+escapeGlob(text)+"*", "prefix"+text+"suffix") {
+			t.Fatalf("*%s* should match text that contains it", text)
+		}
+		if Match(escapeGlob(text), text+"x") {
+			t.Fatalf("escaped %q should not match a longer text", text)
+		}
+	})
+}
+
+func BenchmarkMatch(b *testing.B) {
+	benchmarks := map[string][2]string{
+		"literal":   {"user:1000", "user:1000"},
+		"prefix":    {"user:*", "user:1000"},
+		"class":     {"log:[0-9][0-9]*", "log:2026-11-17"},
+		"many-star": {"*a*b*c*d*", "xxaxxbxxcxxdxx"},
+	}
+	for name, input := range benchmarks {
+		b.Run(name, func(b *testing.B) {
+			for b.Loop() {
+				Match(input[0], input[1])
+			}
+		})
+	}
+}

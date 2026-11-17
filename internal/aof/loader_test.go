@@ -211,3 +211,36 @@ func TestDataSurvivesRestart(t *testing.T) {
 	expectValue(t, restartedRouter, "visits", resp.NewBulkString("3"))
 	expectValue(t, restartedRouter, "temp", resp.NewNullBulkString())
 }
+
+type failingReader struct {
+	data      string
+	failAfter int
+	position  int
+}
+
+func (r *failingReader) Read(buffer []byte) (int, error) {
+	if r.position >= r.failAfter {
+		return 0, errors.New("disk read failed")
+	}
+	readCount := copy(buffer, r.data[r.position:r.failAfter])
+	r.position += readCount
+	return readCount, nil
+}
+
+func TestReadFailureIsNotReportedAsCorruption(t *testing.T) {
+	content := encodeCommands([]string{"SET", "a", "1"}, []string{"SET", "b", "2"})
+	source := &failingReader{data: content, failAfter: len(content) - 5}
+
+	_, _, err := replayCommands(source, command.NewRouter(store.New(), nil))
+
+	if err == nil || errors.Is(err, ErrCorrupted) {
+		t.Fatalf("got %v, want a plain read error that is not ErrCorrupted", err)
+	}
+}
+
+func TestLoadReportsUnreadablePath(t *testing.T) {
+	_, _, _, err := loadIntoNewStore(t, t.TempDir())
+	if err == nil {
+		t.Fatal("expected an error when the path is a directory")
+	}
+}

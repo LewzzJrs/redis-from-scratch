@@ -78,8 +78,12 @@ func replayCommands(source io.Reader, executor CommandExecutor) (LoadResult, int
 		if errors.Is(err, io.ErrUnexpectedEOF) {
 			return result, validLength, err
 		}
-		if err != nil {
+		var protocolError *resp.ProtocolError
+		if errors.As(err, &protocolError) {
 			return result, validLength, fmt.Errorf("%w at byte %d: %v", ErrCorrupted, validLength, err)
+		}
+		if err != nil {
+			return result, validLength, fmt.Errorf("read aof file at byte %d: %w", validLength, err)
 		}
 
 		if len(args) > 0 {

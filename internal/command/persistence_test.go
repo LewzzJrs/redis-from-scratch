@@ -1,6 +1,7 @@
 package command
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -169,4 +170,17 @@ func TestRecordedOrderMatchesStoreOrderUnderConcurrency(t *testing.T) {
 			t.Fatalf("%s: replaying the log gives %q, but the live store has %q", key, restored.Text, original.Text)
 		}
 	}
+}
+
+type failingLog struct{}
+
+func (failingLog) Append(args ...string) error {
+	return errors.New("disk full")
+}
+
+func TestWriteStillAppliesWhenLogFails(t *testing.T) {
+	router := NewRouter(store.New(), failingLog{})
+
+	expectReply(t, router, []string{"SET", "k", "v"}, resp.NewSimpleString("OK"))
+	expectReply(t, router, []string{"GET", "k"}, resp.NewBulkString("v"))
 }

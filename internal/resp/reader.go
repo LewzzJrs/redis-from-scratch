@@ -2,6 +2,7 @@ package resp
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -123,14 +124,30 @@ func (r *Reader) readBulkString(lengthText string) (Value, error) {
 		return NewNullBulkString(), nil
 	}
 
-	payloadWithTerminator := make([]byte, length+2)
-	if _, err := io.ReadFull(r.reader, payloadWithTerminator); err != nil {
+	payloadWithTerminator, err := r.readExactly(length + 2)
+	if err != nil {
 		return Value{}, unexpectedEOF(err)
 	}
 	if payloadWithTerminator[length] != '\r' || payloadWithTerminator[length+1] != '\n' {
 		return Value{}, newProtocolError("bulk string not terminated by CRLF")
 	}
 	return NewBulkString(string(payloadWithTerminator[:length])), nil
+}
+
+func (r *Reader) readExactly(byteCount int) ([]byte, error) {
+	if byteCount <= readBufferSize {
+		data := make([]byte, byteCount)
+		_, err := io.ReadFull(r.reader, data)
+		return data, err
+	}
+
+	var data bytes.Buffer
+	data.Grow(readBufferSize)
+	copiedCount, err := io.CopyN(&data, r.reader, int64(byteCount))
+	if copiedCount < int64(byteCount) {
+		return nil, unexpectedEOF(err)
+	}
+	return data.Bytes(), nil
 }
 
 func (r *Reader) readArray(countText string, depth int) (Value, error) {
