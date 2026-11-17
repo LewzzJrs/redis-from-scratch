@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.vscode
+*.aof
+*.exe
+*.out
+*.test
+docker-compose.yml
+Dockerfile
+README.md
